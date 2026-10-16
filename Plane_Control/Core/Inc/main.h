@@ -75,7 +75,16 @@ void Error_Handler(void);
 #define ChipSelect_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
-
+#define readMask 0x80 /** To be ORed with the register address when reading */
+#define writeMask 0x00 /** To be ORed with the register address when writing */
+#define ICM20648_REG_WHO_AM_I  0x00 /**< Device ID register */
+#define ICM20648_REG_PWR_MGMT_1           0x06    /**< Power Management 1 register */
+#define ICM20648_REG_ACCEL_XOUT_H_SH      0x2D    /**< Accelerometer X-axis data high byte                    */
+#define ICM20648_REG_ACCEL_XOUT_L_SH      0x2E    /**< Accelerometer X-axis data low byte                     */
+#define ICM20648_REG_ACCEL_YOUT_H_SH      0x2F    /**< Accelerometer Y-axis data high byte                    */
+#define ICM20648_REG_ACCEL_YOUT_L_SH      0x30    /**< Accelerometer Y-axis data low byte                     */
+#define ICM20648_REG_ACCEL_ZOUT_H_SH      0x31    /**< Accelerometer Z-axis data high byte                    */
+#define ICM20648_REG_ACCEL_ZOUT_L_SH      0x32    /**< Accelerometer Z-axis data low byte                     */
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

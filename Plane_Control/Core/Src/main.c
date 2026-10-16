@@ -94,9 +94,19 @@ int main(void)
 	uint16_t rawPot2;
 	uint16_t servoControl;
 	uint16_t motorControl;
-	char msg[100];
+
+	//char msg[100];
+	char msg[20];
+	uint8_t buf[6];
+	char retVal;
+	char dispText[100];
+
 	float potentiometer1Mapped = 0;
 	float potentiometer2Mapped = 0;
+
+	float servoDegrees;
+	float motorPercentage;
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -129,11 +139,33 @@ int main(void)
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
   //HAL_UART_Transmit(&huart2, (uint8_t*)test, strlen(test), HAL_MAX_DELAY);
+  // Initialization of timers and oled
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
   ssd1306_Init();
-  ssd1306_Fill(White);
+
+  // Starting parameters of oled
+  ssd1306_Fill(Black);
   ssd1306_UpdateScreen();
+
+  // Initialization of SPI ACCEL/GYRO/MAGNETO sensor
+  do {
+	  buf[0] = readMask |ICM20648_REG_WHO_AM_I; // Prepare the instruction " read register 0x00 so you send 0x80
+	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET); // Pull the chip select line low
+	  HAL_SPI_Transmit(&hspi1, buf, 1, 100); // Tell the ICM20948 what you want
+	  HAL_SPI_Receive(&hspi1, buf, 1, 100); // Get the answer
+	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET); // Release the slave chip by bringing the line back up
+	  buf[1] = 0;
+	  sprintf(msg, "I am 0x%02X\r\n", buf[0]);
+      HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+  } while (buf[0] != 0xEA);
+
+
+  buf[0] = writeMask | ICM20648_REG_PWR_MGMT_1; // Here you want to turn on the sensors by going out of sleep mode.
+  buf[1] = 0x01; // This is done by writing a 0 on bit 6 of the power management register in the ICM 20948
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+  HAL_SPI_Transmit(&hspi1, buf, 2, 100); // Send the regiter address and its content (2 bytes)
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -172,6 +204,15 @@ int main(void)
 		  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 0);
 	  }
 
+	  servoDegrees = ((float)rawPot1 / 4096.0f) * 180.0f;
+	  motorPercentage = ((float)rawPot2 / 4096.0f) * 100.0f;
+
+
+	  sprintf(dispText, "%5.1f deg| %4.1f %%", servoDegrees, motorPercentage);
+
+	  ssd1306_SetCursor(1, 5);
+	  retVal = ssd1306_WriteString(dispText, Font_7x10, White);
+	  ssd1306_UpdateScreen();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
