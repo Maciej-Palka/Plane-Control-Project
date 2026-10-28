@@ -26,17 +26,67 @@
 
 #include "ssd1306.h"
 #include "ssd1306_fonts.h"
+
+#include "ds1307_for_stm32_hal.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef enum {
+    MANUAL = 0,
+    AUTOPILOT = 1,
+} control_mode_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define UART_MAX_DELAY 1000
 #define ADC_MAX_DELAY 1000
+
+#define readMask  0x80
+#define writeMask 0x00
+
+// Bank 0
+#define ICM_REG_WHO_AM_I              0x00
+#define ICM_REG_USER_CTRL             0x03
+#define ICM_REG_LP_CONFIG             0x05
+#define ICM_REG_PWR_MGMT_1            0x06
+#define ICM_REG_ACCEL_XOUT_H          0x2D
+#define ICM_REG_EXT_SLV_SENS_DATA_00  0x3B
+#define ICM_REG_BANK_SEL              0x7F
+
+// Bank 3
+#define ICM_REG_I2C_MST_ODR_CONFIG    0x00
+#define ICM_REG_I2C_MST_CTRL          0x01
+#define ICM_REG_I2C_SLV0_ADDR         0x03
+#define ICM_REG_I2C_SLV0_REG          0x04
+#define ICM_REG_I2C_SLV0_CTRL         0x05
+#define ICM_REG_I2C_SLV0_DO           0x06
+
+// Magnetometr AK09916
+#define AK09916_I2C_ADDR              0x0C
+#define AK09916_ST1                   0x10
+#define AK09916_CNTL2                 0x31
+#define AK09916_CNTL3                 0x32
+
+// Gyroscope
+#define ICM_REG_GYRO_XOUT_H 0x33
+#define ICM_REG_GYRO_XOUT_L 0x34
+
+#define GYRO_SMPLRT_DIV 0x00
+#define GYRO_CONFIG 0x01
+#define GYRO_RANGE 0x02
+
+// RTC
+#define DS1307_ADDR (0x68 << 1)
+#define DEC_TO_BCD(val)    ((((val) / 10) << 4) | ((val) % 10))
+
+
+// Other definitions
+#define FONT Font_6x8
+
+
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -54,11 +104,13 @@ SPI_HandleTypeDef hspi1;
 
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim8;
 
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-
+static const uint8_t TMP102_ADDR = 0x48 << 1; // Use 8-bit address
+static const uint8_t REG_TEMP = 0x00;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -72,12 +124,179 @@ static void MX_USART2_UART_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_TIM8_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+control_mode_t mode = 0;
+volatile char mode_rx[1];
+uint8_t tx_buf[2];
+uint8_t rx_buf[2];
+uint32_t last_time = 0;
+uint8_t debug_flag = 0;
+float gyro_offset = 0.0f;
+float gyro_angle = 0.0f;
+volatile uint32_t val1 = 0;
+volatile uint32_t val2 = 0;
+volatile uint32_t difference = 0;
+uint16_t time_ms = 0;
+volatile uint32_t capture_difference = 0;
+volatile uint8_t new_data_ready = 0;
+
+void ICM_select_bank(uint8_t bank){
+	uint8_t tx_buf[2];
+	tx_buf[0] = writeMask | ICM_REG_BANK_SEL;
+    tx_buf[1] = bank << 4;
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+    HAL_SPI_Transmit(&hspi1, tx_buf, 2, 100);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+}
+
+void ICM_write_reg(uint8_t REG_NAME, uint8_t val){
+	uint8_t tx_buf[2];
+	tx_buf[0] = writeMask | REG_NAME;
+	tx_buf[1] = val;
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+	HAL_SPI_Transmit(&hspi1, tx_buf, 2, 100);
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+
+}
+
+void ICM_read_reg(uint8_t REG_NAME, uint8_t *buffer, uint8_t len){
+	uint8_t reg_addr[2];
+	reg_addr[0] = readMask | REG_NAME;
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+	HAL_SPI_Transmit(&hspi1, reg_addr, 1, 100);
+	HAL_SPI_Receive(&hspi1, buffer, len, 100);
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+}
+
+void ICM_mag_write(uint8_t reg, uint8_t val) {
+    ICM_select_bank(3);
+    ICM_write_reg(ICM_REG_I2C_SLV0_ADDR, AK09916_I2C_ADDR);
+    ICM_write_reg(ICM_REG_I2C_SLV0_REG, reg);
+    ICM_write_reg(ICM_REG_I2C_SLV0_DO, val);
+    ICM_write_reg(ICM_REG_I2C_SLV0_CTRL, 0x80 | 1);
+    HAL_Delay(20);
+}
+
+uint16_t ADC_read(ADC_HandleTypeDef adc_port){
+	HAL_ADC_Start(&adc_port);
+	HAL_ADC_PollForConversion(&adc_port, HAL_MAX_DELAY);
+	return HAL_ADC_GetValue(&adc_port);
+}
+
+float TMP_read(I2C_HandleTypeDef i2c_port, uint8_t SENSOR_ADDR, uint8_t REG_ADDR){
+	HAL_StatusTypeDef ret;
+	uint8_t buf_tmp[16];
+	uint16_t val;
+	float temp_c;
+
+	buf_tmp[0] = REG_ADDR;
+
+
+	ret = HAL_I2C_Master_Transmit(&i2c_port, SENSOR_ADDR, buf_tmp, 1, 200);
+	if ( ret != HAL_OK ) {
+		temp_c = 4096.0; // Tx error flag
+	}
+	else {
+		// Read 2 bytes from the temperature register
+		ret = HAL_I2C_Master_Receive(&i2c_port, SENSOR_ADDR, buf_tmp, 2, 200);
+		  if ( ret != HAL_OK ) {
+		  	temp_c = -4096.0; // Rx error flag
+		  }
+		  else {
+		  	//Combine the bytes
+		  	val = ((int16_t)buf_tmp[0] << 4) | (buf_tmp[1] >> 4);
+		  	// Convert to 2's complement, since temperature can be negative
+		  	if ( val > 0x7FF ) {
+		  	    val |= 0xF000;
+		  	}
+		  	// Convert to float temperature value (Celsius)
+		  	temp_c = val * 0.0625;
+		  	// Convert temperature to decimal format
+		  	temp_c *= 100;
+		  }
+	}
+	return(temp_c);
+}
+
+void toggleMode(void){
+	mode = (control_mode_t)!mode;
+}
+
+HAL_StatusTypeDef DS1307_SetTime(I2C_HandleTypeDef *i2c_port, uint8_t year, uint8_t month, uint8_t date, uint8_t day, uint8_t hour, uint8_t min, uint8_t sec) {
+    uint8_t buffer[8];
+
+    // 1. Pierwszy bajt to adres rejestru startowego w pamięci DS1307
+    buffer[0] = 0x00;
+
+    // 2. Konwersja danych na format BCD i wypełnienie bufora
+    buffer[1] = DEC_TO_BCD(sec) & 0x7F;       // Reg 0x00: Sekundy, Bit 7 (CH) = 0 (Zegar działa)
+    buffer[2] = DEC_TO_BCD(min);              // Reg 0x01: Minuty
+    buffer[3] = DEC_TO_BCD(hour) & 0x3F;      // Reg 0x02: Godziny (Bit 6 = 0 wymusza tryb 24-godzinny)
+    buffer[4] = DEC_TO_BCD(day);               // Reg 0x03: Dzień tygodnia (1-7)
+    buffer[5] = DEC_TO_BCD(date);              // Reg 0x04: Dzień miesiąca
+    buffer[6] = DEC_TO_BCD(month);             // Reg 0x05: Miesiąc
+    buffer[7] = DEC_TO_BCD(year);              // Reg 0x06: Rok (dwie ostatnie cyfry)
+
+    // 3. Wysłanie całej paczki danych przez HAL_I2C_Master_Transmit
+    // Wysyłamy 8 bajtów (1 bajt adresu rejestru + 7 bajtów danych czasu)
+    return HAL_I2C_Master_Transmit(i2c_port, DS1307_ADDR, buffer, 8, HAL_MAX_DELAY);
+}
+
+int16_t gyro_read(void){
+	int16_t gyroXRead;
+	ICM_read_reg(ICM_REG_GYRO_XOUT_H, rx_buf, 1);
+	gyroXRead = rx_buf[0] << 8;
+	ICM_read_reg(ICM_REG_GYRO_XOUT_L, rx_buf, 1);
+	gyroXRead |= rx_buf[0];
+
+	return(gyroXRead);
+}
+
+void Update_Gyro_Angle(void) {
+    uint32_t current_time = HAL_GetTick();
+
+    if (current_time == last_time) {
+        return;
+    }
+
+    float dt = (float)(current_time - last_time) / 1000.0f;
+    last_time = current_time;
+
+    int16_t raw_gyro = gyro_read();
+
+    // to dps
+    float gyro_dps = (float)raw_gyro / 32.8f;
+
+    // subtract offset measured earlier
+    gyro_dps -= gyro_offset;
+
+    // discard value if it is very low
+    if (gyro_dps > -0.5f && gyro_dps < 0.5f) {
+        gyro_dps = 0.0f;
+    }
+
+    gyro_angle += gyro_dps * dt;
+}
+
+void Calibrate_Gyro(void) {
+    int32_t raw_sum = 0;
+    const int samples = 500;
+
+    // Sensor must stand still at this point
+    for (int i = 0; i < samples; i++) {
+        raw_sum += gyro_read();
+        HAL_Delay(2); // Slight delay to give sensor some time to aquire new data
+    }
+
+    // Counting medium value from samples
+    gyro_offset = ((float)raw_sum / samples) / 32.8f;
+}
 
 /* USER CODE END 0 */
 
@@ -89,23 +308,33 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-	//char test[] = "Automotive systems 2";
+	uint32_t last;
+	uint32_t now;
+
 	uint16_t rawPot1;
 	uint16_t rawPot2;
 	uint16_t servoControl;
 	uint16_t motorControl;
 
-	//char msg[100];
-	char msg[20];
-	uint8_t buf[6];
+
+	char msg[100];
+	const char* mode_names[] = {
+	    "MANUAL",
+	    "AUTO"
+	};
 	char retVal;
 	char dispText[100];
 
+	uint8_t seconds;
+	uint8_t minutes;
+	uint8_t hours;
+
 	float potentiometer1Mapped = 0;
 	float potentiometer2Mapped = 0;
-
 	float servoDegrees;
 	float motorPercentage;
+	float tempC;
+	float servoA = 0.0;
 
   /* USER CODE END 1 */
 
@@ -137,35 +366,61 @@ int main(void)
   MX_TIM3_Init();
   MX_ADC2_Init();
   MX_I2C1_Init();
+  MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
-  //HAL_UART_Transmit(&huart2, (uint8_t*)test, strlen(test), HAL_MAX_DELAY);
-  // Initialization of timers and oled
+
+  // Initialization of timers, interrupts and oled
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
-  ssd1306_Init();
+  HAL_UART_Receive_IT (&huart2, (uint8_t*)mode_rx, 1);
+  HAL_TIM_IC_Start_IT(&htim8, TIM_CHANNEL_1);
 
-  // Starting parameters of oled
+  ssd1306_Init();
   ssd1306_Fill(Black);
   ssd1306_UpdateScreen();
 
-  // Initialization of SPI ACCEL/GYRO/MAGNETO sensor
+  //-----------------------ACCELEROMETER-----------------------------
+  // Select register bank 0 and reset the sensor
+  ICM_select_bank(0);
+  HAL_Delay(5);
+  ICM_write_reg(ICM_REG_PWR_MGMT_1, 0x80);
+  HAL_Delay(100);
+
+  // 1. Read sensor register and check it
   do {
-	  buf[0] = readMask |ICM20648_REG_WHO_AM_I; // Prepare the instruction " read register 0x00 so you send 0x80
-	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET); // Pull the chip select line low
-	  HAL_SPI_Transmit(&hspi1, buf, 1, 100); // Tell the ICM20948 what you want
-	  HAL_SPI_Receive(&hspi1, buf, 1, 100); // Get the answer
-	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET); // Release the slave chip by bringing the line back up
-	  buf[1] = 0;
-	  sprintf(msg, "I am 0x%02X\r\n", buf[0]);
-      HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-  } while (buf[0] != 0xEA);
+  	ICM_read_reg(ICM_REG_WHO_AM_I, rx_buf, 1);
+  	sprintf(msg, "I am 0x%02X\r\n", rx_buf[0]);
+  	HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+  	HAL_Delay(50);
+  } while (rx_buf[0] != 0xEA);
 
+  // 2. Sensor Wakeup and I2C configuration
+  ICM_write_reg(ICM_REG_PWR_MGMT_1, 0x01);          // Wakeup, Auto clock speed
+  HAL_Delay(10);
 
-  buf[0] = writeMask | ICM20648_REG_PWR_MGMT_1; // Here you want to turn on the sensors by going out of sleep mode.
-  buf[1] = 0x01; // This is done by writing a 0 on bit 6 of the power management register in the ICM 20948
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
-  HAL_SPI_Transmit(&hspi1, buf, 2, 100); // Send the regiter address and its content (2 bytes)
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+  // 3. set up gyroscope parameters - +/-1000 dps
+  ICM_select_bank(2);
+  ICM_write_reg(GYRO_SMPLRT_DIV, 0x00);
+  ICM_write_reg(GYRO_CONFIG, GYRO_RANGE << 1);
+  ICM_select_bank(0);
+
+  DS1307_Init(&hi2c1);
+  DS1307_SetClockHalt(0);
+  /* setup date and time
+  DS1307_SetDate(26);
+  DS1307_SetMonth(10);
+  DS1307_SetYear(2026);
+  DS1307_SetDayOfWeek(1);
+  DS1307_SetHour(15);
+  DS1307_SetMinute(21);
+  DS1307_SetSecond(0);
+  */
+
+  // Gyroscope calibration
+  Calibrate_Gyro();
+
+  last = HAL_GetTick();
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -173,46 +428,115 @@ int main(void)
 
   while (1)
   {
-	  // Potentiometer 1 read and servo controll
-	  HAL_ADC_Start(&hadc1);
-	  HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
-	  rawPot1 = HAL_ADC_GetValue(&hadc1);
+	  //--------------------------------------------------
+	  // Read values from potetiometers, map it and set PWM signal accordingly
 
-	  potentiometer1Mapped = (((float)rawPot1 / 4096.0f) * 1500.0f) + 750.0f;
-	  servoControl = (uint16_t)potentiometer1Mapped;
+	  now = HAL_GetTick();
+	  if(now - last >= 50){
+		  // Read raw values from potentiometer
+		  rawPot1 = ADC_read(hadc1);
+		  rawPot2 = ADC_read(hadc2);
 
-	  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, servoControl);
+		  // Get time
+		  seconds = DS1307_GetSecond();
+		  minutes = DS1307_GetMinute();
+		  hours = DS1307_GetHour();
 
-	  // Potentiometer 2 read and motor controll
-	  HAL_ADC_Start(&hadc2);
-	  HAL_ADC_PollForConversion(&hadc2, HAL_MAX_DELAY);
-	  rawPot2 = HAL_ADC_GetValue(&hadc2);
+		  // Read temperature from thermometer
+		  tempC = TMP_read(hi2c1, TMP102_ADDR, REG_TEMP);
 
-	  potentiometer2Mapped = (((float)rawPot2 / 4096.0f) * 1000.0f);
-	  motorControl = (uint16_t)potentiometer2Mapped;
+		  // Read data from gyro
+		  Update_Gyro_Angle();
 
-	  // Debug
-	  //sprintf(msg, "%hu\r\n", rawPot2);
-	  //HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+		  // Read input capture
+		  if (new_data_ready)
+		      {
+		          uint32_t diff_copy = capture_difference;
+		          new_data_ready = 0;
 
-	  // If value of PWM is 25% or less, do not set output timer
-	  // This is due to the fact that it might damage microcontroller
-	  if (motorControl > 250){
-		  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, motorControl);
+		          if (diff_copy > 0) {
+		              time_ms = (float)diff_copy / 1000.0f;
+		          }
+		      }
+
+		  if(mode == MANUAL){
+			  // Potentiometer 1 read and servo controll
+			  potentiometer1Mapped = (((float)rawPot1 / 4096.0f) * 1500.0f) + 750.0f;
+			  servoControl = (uint16_t)potentiometer1Mapped;
+
+			  // Potentiometer 2 read and motor controll
+
+			  potentiometer2Mapped = (((float)rawPot2 / 4096.0f) * 1000.0f);
+			  motorControl = (uint16_t)potentiometer2Mapped;
+
+			  servoDegrees = ((float)rawPot1 / 4096.0f) * 180.0f;
+			  motorPercentage = ((float)rawPot2 / 4096.0f) * 100.0f;
+
+		  }
+
+		  else if(mode == AUTOPILOT){
+			  servoControl = 1500;
+			  if(gyro_angle > 180.0 || gyro_angle < 0.0){
+				  servoA = 0.0;
+			  }
+			  else{
+				  servoA = gyro_angle;
+			  }
+			  servoControl = ((servoA/180.0f)*1500.0f) + 750.0f;
+			  motorControl = 500;
+
+			  servoDegrees = servoA;
+			  motorPercentage = 50.0;
+
+		  }
+
+
+
+
+		  // Steer servomotor
+		  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, servoControl);
+
+		  // If value of PWM is 25% or less, do not set output timer
+		  // This is due to the fact that it might damage microcontroller
+		  if (motorControl > 250){
+			  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, motorControl);
+		  }
+		  else{
+			  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 0);
+		  }
+
+
+		  //--------------------------------------------------
+		  // Display relevant data on oled
+
+
+		  sprintf(dispText, "%5.1f deg | %5.1f %%", servoDegrees, motorPercentage);
+		  ssd1306_SetCursor(1, 1);
+		  retVal = ssd1306_WriteString(dispText, FONT, White);
+
+		  ssd1306_SetCursor(1, 12);
+		  sprintf(dispText, " %u.%02u C  |  %s    ", ((unsigned int)tempC / 100), ((unsigned int)tempC % 100), mode_names[mode]);
+		  retVal = ssd1306_WriteString(dispText, FONT, White);
+
+		  ssd1306_SetCursor(1, 23);
+		  sprintf(dispText, "%02u:%02u:%02u  |  %3.1f", hours, minutes, seconds, gyro_angle);
+		  retVal = ssd1306_WriteString(dispText, FONT, White);
+
+		  ssd1306_UpdateScreen();
+
+		  // Debug code fragment
+		  if(debug_flag){
+			  sprintf(msg, "servo: %u, motor: %u, temp: %4.2f, mode: %s, time: %02u:%02u:%02u, angle: %3.1f, IC:%u ms\r\n", rawPot1, rawPot2, tempC, mode_names[mode], hours, minutes, seconds, gyro_angle, time_ms);
+			  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+			  debug_flag = 0;
+		  }
+
+		  last = HAL_GetTick();
 	  }
-	  else{
-		  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 0);
-	  }
 
-	  servoDegrees = ((float)rawPot1 / 4096.0f) * 180.0f;
-	  motorPercentage = ((float)rawPot2 / 4096.0f) * 100.0f;
+	  //HAL_UART_Transmit(&huart2, (uint8_t*)tx_buffer, strlen(tx_buffer), HAL_MAX_DELAY);
+	  //HAL_Delay(100);
 
-
-	  sprintf(dispText, "%5.1f deg| %4.1f %%", servoDegrees, motorPercentage);
-
-	  ssd1306_SetCursor(1, 5);
-	  retVal = ssd1306_WriteString(dispText, Font_7x10, White);
-	  ssd1306_UpdateScreen();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -616,6 +940,56 @@ static void MX_TIM3_Init(void)
 }
 
 /**
+  * @brief TIM8 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM8_Init(void)
+{
+
+  /* USER CODE BEGIN TIM8_Init 0 */
+
+  /* USER CODE END TIM8_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
+
+  /* USER CODE BEGIN TIM8_Init 1 */
+
+  /* USER CODE END TIM8_Init 1 */
+  htim8.Instance = TIM8;
+  htim8.Init.Prescaler = 80-1;
+  htim8.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim8.Init.Period = 65535;
+  htim8.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim8.Init.RepetitionCounter = 0;
+  htim8.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_IC_Init(&htim8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim8, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim8, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM8_Init 2 */
+
+  /* USER CODE END TIM8_Init 2 */
+
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -677,6 +1051,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : PB15 */
+  GPIO_InitStruct.Pin = GPIO_PIN_15;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
   /*Configure GPIO pin : ChipSelect_Pin */
   GPIO_InitStruct.Pin = ChipSelect_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -684,13 +1064,67 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(ChipSelect_GPIO_Port, &GPIO_InitStruct);
 
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_PIN){
+	if((GPIO_PIN == GPIO_PIN_13)){
+		toggleMode();
+	}
+	else if((GPIO_PIN == GPIO_PIN_15)){
+			debug_flag = 1;
+		}
+}
 
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
+	if(mode_rx[0] == 'A'){
+		mode = 1;
+	}
+	else if(mode_rx[0] == 'M'){
+		mode = 0;
+	}
+
+	HAL_UART_Receive_IT(&huart2, (uint8_t*)mode_rx, 1);
+
+}
+
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+    static uint32_t val1 = 0;
+    static uint8_t first_edge = 1;
+    uint32_t val2;
+
+    if (htim->Instance == TIM8 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
+    {
+        if (first_edge)
+        {
+            val1 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+            first_edge = 0;
+        }
+        else
+        {
+            val2 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+
+
+            if (val2 >= val1) {
+                capture_difference = val2 - val1;
+            } else {
+                capture_difference = (htim->Init.Period - val1) + val2 + 1;
+            }
+
+            val1 = val2;
+            new_data_ready = 1;
+        }
+    }
+}
 /* USER CODE END 4 */
 
 /**
