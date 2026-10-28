@@ -104,6 +104,7 @@ SPI_HandleTypeDef hspi1;
 
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim8;
 
 UART_HandleTypeDef huart2;
 
@@ -123,6 +124,7 @@ static void MX_USART2_UART_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_TIM8_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -131,13 +133,18 @@ static void MX_I2C1_Init(void);
 /* USER CODE BEGIN 0 */
 control_mode_t mode = 0;
 volatile char mode_rx[1];
-int16_t probeX;
 uint8_t tx_buf[2];
 uint8_t rx_buf[2];
-int16_t magX, magY, magZ;
+uint32_t last_time = 0;
+uint8_t debug_flag = 0;
+float gyro_offset = 0.0f;
 float gyro_angle = 0.0f;
-uint16_t last_time = 0;
-
+volatile uint32_t val1 = 0;
+volatile uint32_t val2 = 0;
+volatile uint32_t difference = 0;
+uint16_t time_ms = 0;
+volatile uint32_t capture_difference = 0;
+volatile uint8_t new_data_ready = 0;
 
 void ICM_select_bank(uint8_t bank){
 	uint8_t tx_buf[2];
@@ -254,19 +261,41 @@ int16_t gyro_read(void){
 void Update_Gyro_Angle(void) {
     uint32_t current_time = HAL_GetTick();
 
+    if (current_time == last_time) {
+        return;
+    }
+
     float dt = (float)(current_time - last_time) / 1000.0f;
     last_time = current_time;
 
-    if (dt > 0.1f) dt = 0.0f;
-
-    // Odczyt prawidłowej wartości int16_t ze znakiem
     int16_t raw_gyro = gyro_read();
 
-    // Pojedyncze przeliczenie na dps dla zakresu 1000 dps
+    // to dps
     float gyro_dps = (float)raw_gyro / 32.8f;
 
-    // Całkowanie
+    // subtract offset measured earlier
+    gyro_dps -= gyro_offset;
+
+    // discard value if it is very low
+    if (gyro_dps > -0.5f && gyro_dps < 0.5f) {
+        gyro_dps = 0.0f;
+    }
+
     gyro_angle += gyro_dps * dt;
+}
+
+void Calibrate_Gyro(void) {
+    int32_t raw_sum = 0;
+    const int samples = 500;
+
+    // Sensor must stand still at this point
+    for (int i = 0; i < samples; i++) {
+        raw_sum += gyro_read();
+        HAL_Delay(2); // Slight delay to give sensor some time to aquire new data
+    }
+
+    // Counting medium value from samples
+    gyro_offset = ((float)raw_sum / samples) / 32.8f;
 }
 
 /* USER CODE END 0 */
@@ -279,6 +308,8 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+	uint32_t last;
+	uint32_t now;
 
 	uint16_t rawPot1;
 	uint16_t rawPot2;
@@ -286,8 +317,7 @@ int main(void)
 	uint16_t motorControl;
 
 
-	char msg[80];
-	char tx_buffer[30];
+	char msg[100];
 	const char* mode_names[] = {
 	    "MANUAL",
 	    "AUTO"
@@ -295,32 +325,16 @@ int main(void)
 	char retVal;
 	char dispText[100];
 
-
-	uint8_t buf[6];
-	uint8_t mag_buf[9];
 	uint8_t seconds;
 	uint8_t minutes;
 	uint8_t hours;
 
-
-
-
-
 	float potentiometer1Mapped = 0;
 	float potentiometer2Mapped = 0;
-
 	float servoDegrees;
 	float motorPercentage;
 	float tempC;
-	//float gyroVal;
-
-
-	//uint8_t currentVal;
-
-	 	// to hold communication errors if such occur
-	 			// to hold the character string for UART communication or the bytes from the TMP102 chip				// to hold raw value from the TMP102 chip
-				// to hold the temperature value in Celcius
-	char tempDispText[24];
+	float servoA = 0.0;
 
   /* USER CODE END 1 */
 
@@ -352,14 +366,14 @@ int main(void)
   MX_TIM3_Init();
   MX_ADC2_Init();
   MX_I2C1_Init();
+  MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
-
-
 
   // Initialization of timers, interrupts and oled
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
   HAL_UART_Receive_IT (&huart2, (uint8_t*)mode_rx, 1);
+  HAL_TIM_IC_Start_IT(&htim8, TIM_CHANNEL_1);
 
   ssd1306_Init();
   ssd1306_Fill(Black);
@@ -384,49 +398,15 @@ int main(void)
   ICM_write_reg(ICM_REG_PWR_MGMT_1, 0x01);          // Wakeup, Auto clock speed
   HAL_Delay(10);
 
-  // 3. set up gyroscope parameters - 1000 dps
+  // 3. set up gyroscope parameters - +/-1000 dps
   ICM_select_bank(2);
   ICM_write_reg(GYRO_SMPLRT_DIV, 0x00);
   ICM_write_reg(GYRO_CONFIG, GYRO_RANGE << 1);
   ICM_select_bank(0);
-  /*
-  ICM_read_reg(ICM_REG_GYRO_XOUT_H, rx_buf, 1);
-  gyroXRead = rx_buf[0] << 8;
-  ICM_read_reg(ICM_REG_GYRO_XOUT_L, rx_buf, 1);
-  gyroXRead |= rx_buf[0];
-
-  gyroXVal = (float)gyroXRead/1000.0f;
-  sprintf(msg, "Angle: %.1f\r\n", gyroXVal);
-
-
-  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 200);
-  */
-
-
-  /*
-  ICM_write_reg(ICM_REG_LP_CONFIG, 0x40);           // Turn on I2C_MST_CYCLE (actvates I2C_MST_ODR_CONFIG!)
-  ICM_write_reg(ICM_REG_USER_CTRL, 0x30);           // SPI only (0x10) + I2C Master Enable (0x20)
-
-  ICM_select_bank(3);
-  ICM_write_reg(ICM_REG_I2C_MST_CTRL, 0x17);        // Clock I2C 345.6 kHz + STOP signal between readings
-  ICM_write_reg(ICM_REG_I2C_MST_ODR_CONFIG, 0x04);  // Odświeżanie I2C Master ~68.75 Hz
-
-  // 3. Magnetometer reset and set up of continous read mode with f = 100 Hz
-  ICM_mag_write(AK09916_CNTL3, 0x01);               // Soft reset AK09916
-  ICM_mag_write(AK09916_CNTL2, 0x08);               // Continuous read mode 4 (100 Hz)
-
-  // 4. SLV0 Read 9 bytes from 0x10
-  ICM_write_reg(ICM_REG_I2C_SLV0_ADDR, readMask | AK09916_I2C_ADDR);
-  ICM_write_reg(ICM_REG_I2C_SLV0_REG, AK09916_ST1);
-  ICM_write_reg(ICM_REG_I2C_SLV0_CTRL, 0x80 | 9);
-
-  ICM_select_bank(0);
-
-  */
 
   DS1307_Init(&hi2c1);
   DS1307_SetClockHalt(0);
-  /*
+  /* setup date and time
   DS1307_SetDate(26);
   DS1307_SetMonth(10);
   DS1307_SetYear(2026);
@@ -436,16 +416,10 @@ int main(void)
   DS1307_SetSecond(0);
   */
 
+  // Gyroscope calibration
+  Calibrate_Gyro();
 
-  /*
-  if (DS1307_SetTime(&hi2c1, 26, 10, 26, 2, 14, 11, 0) == HAL_OK) {
-	  	  sprintf(tx_buffer, "Setting time completed");
-
-      } else {
-    	  sprintf(tx_buffer, "dupa");
-          // Błąd komunikacji I2C - sprawdź rezystory pull-up lub połączenia SCL/SDA
-      }
-  HAL_UART_Transmit(&huart2, (uint8_t*)tx_buffer, strlen(tx_buffer), HAL_MAX_DELAY);*/
+  last = HAL_GetTick();
 
   /* USER CODE END 2 */
 
@@ -457,89 +431,112 @@ int main(void)
 	  //--------------------------------------------------
 	  // Read values from potetiometers, map it and set PWM signal accordingly
 
+	  now = HAL_GetTick();
+	  if(now - last >= 50){
+		  // Read raw values from potentiometer
+		  rawPot1 = ADC_read(hadc1);
+		  rawPot2 = ADC_read(hadc2);
 
-	  // Potentiometer 1 read and servo controll
-	  rawPot1 = ADC_read(hadc1);
-	  potentiometer1Mapped = (((float)rawPot1 / 4096.0f) * 1500.0f) + 750.0f;
-	  servoControl = (uint16_t)potentiometer1Mapped;
-	  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, servoControl);
+		  // Get time
+		  seconds = DS1307_GetSecond();
+		  minutes = DS1307_GetMinute();
+		  hours = DS1307_GetHour();
 
-	  // Potentiometer 2 read and motor controll
-	  rawPot2 = ADC_read(hadc2);
-	  potentiometer2Mapped = (((float)rawPot2 / 4096.0f) * 1000.0f);
-	  motorControl = (uint16_t)potentiometer2Mapped;
+		  // Read temperature from thermometer
+		  tempC = TMP_read(hi2c1, TMP102_ADDR, REG_TEMP);
 
-	  // If value of PWM is 25% or less, do not set output timer
-	  // This is due to the fact that it might damage microcontroller
-	  if (motorControl > 250){
-		  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, motorControl);
+		  // Read data from gyro
+		  Update_Gyro_Angle();
+
+		  // Read input capture
+		  if (new_data_ready)
+		      {
+		          uint32_t diff_copy = capture_difference;
+		          new_data_ready = 0;
+
+		          if (diff_copy > 0) {
+		              time_ms = (float)diff_copy / 1000.0f;
+		          }
+		      }
+
+		  if(mode == MANUAL){
+			  // Potentiometer 1 read and servo controll
+			  potentiometer1Mapped = (((float)rawPot1 / 4096.0f) * 1500.0f) + 750.0f;
+			  servoControl = (uint16_t)potentiometer1Mapped;
+
+			  // Potentiometer 2 read and motor controll
+
+			  potentiometer2Mapped = (((float)rawPot2 / 4096.0f) * 1000.0f);
+			  motorControl = (uint16_t)potentiometer2Mapped;
+
+			  servoDegrees = ((float)rawPot1 / 4096.0f) * 180.0f;
+			  motorPercentage = ((float)rawPot2 / 4096.0f) * 100.0f;
+
+		  }
+
+		  else if(mode == AUTOPILOT){
+			  servoControl = 1500;
+			  if(gyro_angle > 180.0 || gyro_angle < 0.0){
+				  servoA = 0.0;
+			  }
+			  else{
+				  servoA = gyro_angle;
+			  }
+			  servoControl = ((servoA/180.0f)*1500.0f) + 750.0f;
+			  motorControl = 500;
+
+			  servoDegrees = servoA;
+			  motorPercentage = 50.0;
+
+		  }
+
+
+
+
+		  // Steer servomotor
+		  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, servoControl);
+
+		  // If value of PWM is 25% or less, do not set output timer
+		  // This is due to the fact that it might damage microcontroller
+		  if (motorControl > 250){
+			  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, motorControl);
+		  }
+		  else{
+			  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 0);
+		  }
+
+
+		  //--------------------------------------------------
+		  // Display relevant data on oled
+
+
+		  sprintf(dispText, "%5.1f deg | %5.1f %%", servoDegrees, motorPercentage);
+		  ssd1306_SetCursor(1, 1);
+		  retVal = ssd1306_WriteString(dispText, FONT, White);
+
+		  ssd1306_SetCursor(1, 12);
+		  sprintf(dispText, " %u.%02u C  |  %s    ", ((unsigned int)tempC / 100), ((unsigned int)tempC % 100), mode_names[mode]);
+		  retVal = ssd1306_WriteString(dispText, FONT, White);
+
+		  ssd1306_SetCursor(1, 23);
+		  sprintf(dispText, "%02u:%02u:%02u  |  %3.1f", hours, minutes, seconds, gyro_angle);
+		  retVal = ssd1306_WriteString(dispText, FONT, White);
+
+		  ssd1306_UpdateScreen();
+
+		  // Debug code fragment
+		  if(debug_flag){
+			  sprintf(msg, "servo: %u, motor: %u, temp: %4.2f, mode: %s, time: %02u:%02u:%02u, angle: %3.1f, IC:%u ms\r\n", rawPot1, rawPot2, tempC, mode_names[mode], hours, minutes, seconds, gyro_angle, time_ms);
+			  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+			  debug_flag = 0;
+		  }
+
+		  last = HAL_GetTick();
 	  }
-	  else{
-		  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 0);
-	  }
-
-
-	  //--------------------------------------------------
-	  // Read data from magnetometer and send it over UART to laptop
-
-	  // Read data from magnetometer (and accel)
-	  /*
-	  ICM_read_reg(ICM_REG_ACCEL_XOUT_H, buf, 2);
-	  probeX = (int16_t)((buf[0] << 8) | buf[1]);
-	  ICM_read_reg(ICM_REG_EXT_SLV_SENS_DATA_00, mag_buf, 9);
-	  if ((mag_buf[0] & 0x01) && !(mag_buf[8] & 0x08)) {
-	        magX = (int16_t)((mag_buf[2] << 8) | mag_buf[1]);
-	        magY = (int16_t)((mag_buf[4] << 8) | mag_buf[3]);
-	        magZ = (int16_t)((mag_buf[6] << 8) | mag_buf[5]);
-	  }
-		*/
-	  Update_Gyro_Angle();
-	  //gyroVal = gyro_angle;
-
-	  // 4. Wysłanie danych przez UART
-	  sprintf(msg, "AccX:%hd | Mag X:%hd\r\n", probeX, magX);
-	  //HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-
-	  //--------------------------------------------------
-	  //status = HAL_I2C_Mem_Read(&hi2c1, TMP102_ADDR << 1, REG_TEMP, I2C_MEMADD_SIZE_8BIT, tempC, 2, 200);
-	  tempC = TMP_read(hi2c1, TMP102_ADDR, REG_TEMP);
-
-
-	  //--------------------------------------------------
-	  // Display relevant data on oled
-
-	  servoDegrees = ((float)rawPot1 / 4096.0f) * 180.0f;
-	  motorPercentage = ((float)rawPot2 / 4096.0f) * 100.0f;
-
-	  sprintf(dispText, "%5.1f deg | %5.1f %%", servoDegrees, motorPercentage);
-	  ssd1306_SetCursor(1, 1);
-	  retVal = ssd1306_WriteString(dispText, FONT, White);
-
-	  ssd1306_SetCursor(1, 12);
-	  sprintf(tempDispText, " %u.%02u C  |  %s    ", ((unsigned int)tempC / 100), ((unsigned int)tempC % 100), mode_names[mode]);
-	  retVal = ssd1306_WriteString(tempDispText, FONT, White);
-
-	  ssd1306_SetCursor(1, 23);
-	  seconds = DS1307_GetSecond();
-	  minutes = DS1307_GetMinute();
-	  hours = DS1307_GetHour();
-	  sprintf(dispText, "%02u:%02u:%02u  |  %3.1f", hours, minutes, seconds, gyro_angle);
-	  retVal = ssd1306_WriteString(dispText, FONT, White);
-
-	  ssd1306_UpdateScreen();
-
-	  // Wysyłanie przez UART
 
 	  //HAL_UART_Transmit(&huart2, (uint8_t*)tx_buffer, strlen(tx_buffer), HAL_MAX_DELAY);
 	  //HAL_Delay(100);
 
-	  //--------------------------------------------------
-	  sprintf(msg, "Angle: %.1f\r\n", gyro_angle);
-
-
-	  //HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 200);
-
-	  //HAL_Delay(100);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -943,6 +940,56 @@ static void MX_TIM3_Init(void)
 }
 
 /**
+  * @brief TIM8 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM8_Init(void)
+{
+
+  /* USER CODE BEGIN TIM8_Init 0 */
+
+  /* USER CODE END TIM8_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
+
+  /* USER CODE BEGIN TIM8_Init 1 */
+
+  /* USER CODE END TIM8_Init 1 */
+  htim8.Instance = TIM8;
+  htim8.Init.Prescaler = 80-1;
+  htim8.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim8.Init.Period = 65535;
+  htim8.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim8.Init.RepetitionCounter = 0;
+  htim8.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_IC_Init(&htim8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim8, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim8, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM8_Init 2 */
+
+  /* USER CODE END TIM8_Init 2 */
+
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -1004,6 +1051,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : PB15 */
+  GPIO_InitStruct.Pin = GPIO_PIN_15;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
   /*Configure GPIO pin : ChipSelect_Pin */
   GPIO_InitStruct.Pin = ChipSelect_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -1022,9 +1075,12 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_PIN){
-	if((GPIO_PIN = GPIO_PIN_13)){
+	if((GPIO_PIN == GPIO_PIN_13)){
 		toggleMode();
 	}
+	else if((GPIO_PIN == GPIO_PIN_15)){
+			debug_flag = 1;
+		}
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
@@ -1037,6 +1093,37 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
 
 	HAL_UART_Receive_IT(&huart2, (uint8_t*)mode_rx, 1);
 
+}
+
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+    static uint32_t val1 = 0;
+    static uint8_t first_edge = 1;
+    uint32_t val2;
+
+    if (htim->Instance == TIM8 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
+    {
+        if (first_edge)
+        {
+            val1 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+            first_edge = 0;
+        }
+        else
+        {
+            val2 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+
+
+            if (val2 >= val1) {
+                capture_difference = val2 - val1;
+            } else {
+                capture_difference = (htim->Init.Period - val1) + val2 + 1;
+            }
+
+            val1 = val2;
+            new_data_ready = 1;
+        }
+    }
 }
 /* USER CODE END 4 */
 
